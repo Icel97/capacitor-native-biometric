@@ -33,6 +33,7 @@ import java.security.KeyStore;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.security.NoSuchProviderException;
+import java.security.ProviderException;
 import java.security.SecureRandom;
 import java.security.UnrecoverableEntryException;
 import java.security.cert.CertificateException;
@@ -44,6 +45,7 @@ import javax.crypto.KeyGenerator;
 import javax.crypto.NoSuchPaddingException;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
+import com.google.firebase.crashlytics.FirebaseCrashlytics;
 
 @CapacitorPlugin(name = "NativeBiometric")
 public class NativeBiometric extends Plugin {
@@ -117,11 +119,22 @@ public class NativeBiometric extends Plugin {
     );
 
     BiometricManager biometricManager = BiometricManager.from(getContext());
-    int canAuthenticateResult = biometricManager.canAuthenticate();
+    int canAuthenticateResult;
     // Using deviceHasCredentials instead of canAuthenticate(DEVICE_CREDENTIAL)
     // > "Developers that wish to check for the presence of a PIN, pattern, or password on these versions should instead use isDeviceSecure."
     // @see https://developer.android.com/reference/androidx/biometric/BiometricManager#canAuthenticate(int)
-    boolean fallbackAvailable = useFallback && this.deviceHasCredentials();
+    boolean fallbackAvailable = false;
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) { // Android 11 (API 30) y superior
+      canAuthenticateResult = biometricManager.canAuthenticate(
+        BiometricManager.Authenticators.BIOMETRIC_STRONG |
+          BiometricManager.Authenticators.DEVICE_CREDENTIAL
+      );
+    } else {
+      canAuthenticateResult = biometricManager.canAuthenticate();
+      fallbackAvailable = useFallback && this.deviceHasCredentials();
+    }
+
     if (useFallback && !fallbackAvailable) {
       canAuthenticateResult = BiometricManager.BIOMETRIC_ERROR_HW_UNAVAILABLE;
     }
@@ -205,6 +218,8 @@ public class NativeBiometric extends Plugin {
         editor.apply();
         call.resolve();
       } catch (GeneralSecurityException | IOException e) {
+        FirebaseCrashlytics.getInstance().log("Failed to save credentials:");
+        FirebaseCrashlytics.getInstance().recordException(e);
         call.reject("Failed to save credentials", e);
         e.printStackTrace();
       }
@@ -352,6 +367,9 @@ public class NativeBiometric extends Plugin {
       key = generateKey(KEY_ALIAS, true);
     } catch (StrongBoxUnavailableException e) {
       key = generateKey(KEY_ALIAS, false);
+    } catch (ProviderException e) {
+      handleProviderException(e);
+      key = generateKey(KEY_ALIAS, false);
     }
     return key;
   }
@@ -374,13 +392,23 @@ public class NativeBiometric extends Plugin {
 
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
         paramBuilder.setUnlockedDeviceRequired(true);
-        paramBuilder.setIsStrongBoxBacked(isStrongBoxBacked);
+        if (isStrongBoxBacked) {
+          paramBuilder.setIsStrongBoxBacked(true);
+        }
       }
 
       generator.init(paramBuilder.build());
       return generator.generateKey();
     } else {
       return getAESKey(KEY_ALIAS);
+    }
+  }
+
+  private void handleProviderException(ProviderException e) throws GeneralSecurityException {
+    if (e.getMessage().contains("Failed to handle super encryption")) {
+        throw new GeneralSecurityException("Super encryption failure", e);
+    } else {
+        throw e;
     }
   }
 
